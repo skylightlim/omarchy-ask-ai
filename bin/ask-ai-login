@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Open Ask AI's browser profile in a visible window, one tab per chat site,
+# to sign in. The hidden browser shares the profile, so it is stopped first;
+# it starts again with the next capture.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/ask-ai"
+mkdir -p "$data_dir"
+
+pgrep -f "$plugin_dir/browser/login.py" >/dev/null && exit 0 # already open
+
+if pkill -f "$plugin_dir/browser/askd.py"; then
+  for _ in {1..50}; do
+    pgrep -f "$data_dir/profile" >/dev/null || break
+    sleep 0.1
+  done
+fi
+
+py=$("$plugin_dir/bin/ask-ai-python") || {
+  notify-send "Ask AI" "CloakBrowser isn't installed. Run $plugin_dir/bin/ask-ai-install."
+  exit 1
+}
+cd "$plugin_dir/browser" &&
+  exec env PYTHONDONTWRITEBYTECODE=1 "$py" "$plugin_dir/browser/login.py" >"$data_dir/login.log" 2>&1

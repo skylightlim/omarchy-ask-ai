@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# Ask AI's shortcut.
+#
+#   ask-ai-bind --show          print the current shortcut, e.g. "SUPER + SHIFT + A"
+#   ask-ai-bind --check <keys>  print "free", "same", or what <keys> already does
+#   ask-ai-bind <keys>          make <keys> the shortcut
+#
+# <keys> is Hyprland's form: "SUPER + SHIFT + A". The shortcut is the Ask AI
+# line in ~/.config/hypr/bindings.lua; setting it rewrites that line, reloads
+# Hyprland, and puts the old line back if Hyprland reports a config error.
+# o.rebind takes the keys over from whatever had them, and a default it took
+# them from comes back once Ask AI moves elsewhere.
+
+set -uo pipefail
+
+bindings="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/ask-ai/shortcut"
+label="Ask AI about a screen region"
+line_re="^o\.(re)?bind\(\"([^\"]+)\", \"$label\", \"ask-ai\"\)"
+
+current() {
+  grep -oE "$line_re" "$bindings" 2>/dev/null | head -1 | sed -E 's/^o\.(re)?bind\("([^"]+)".*/\2/'
+}
+
+# Hyprland's modifier mask for "SUPER + SHIFT + A", and its key.
+parse() {
+  local mask=0 key="" part
+  IFS='+' read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    part=$(tr -d ' ' <<<"$part" | tr '[:lower:]' '[:upper:]')
+    case $part in
+      SHIFT) mask=$((mask | 1)) ;;
+      CTRL | CONTROL) mask=$((mask | 4)) ;;
+      ALT) mask=$((mask | 8)) ;;
+      SUPER | WIN | LOGO | MOD4) mask=$((mask | 64)) ;;
+      "") ;;
+      *) key=$part ;;
+    esac
+  done
+  echo "$mask $key"
+}
+
+check() {
+  local mask key mine
+  read -r mask key <<<"$(parse "$1")"
+  read -r mine_mask mine_key <<<"$(parse "$(current)")"
+  if [[ $mask == "$mine_mask" && $key == "$mine_key" ]]; then
+    echo same
+    return
+  fi
+  hyprctl binds -j 2>/dev/null | jq -r --argjson mask "$mask" --arg key "$key" --arg label "$label" '
+    [ .[] | select(.modmask == $mask and ((.key // "") | ascii_upcase) == $key and (.submap // "") == "")
+          | select(.description != $label) ]
+    | if length == 0 then "free" else (first | .description // .dispatcher // "another shortcut") end'
+}
+
+set_keys() {
+  local keys=$1 old backup
+  [[ $keys =~ ^[A-Z0-9_]+( \+ [A-Z0-9_]+)*$ ]] || { echo "bad keys: $keys" >&2; return 2; }
+  old=$(current)
+  [[ -n $old ]] || { echo "no Ask AI line in $bindings" >&2; return 1; }
+  backup=$(mktemp)
+  cp "$bindings" "$backup"
+  sed -i -E "s|$line_re|o.rebind(\"$keys\", \"$label\", \"ask-ai\")|" "$bindings"
+  hyprctl reload >/dev/null 2>&1
+  sleep 0.3
+  if [[ -n $(hyprctl configerrors 2>/dev/null | grep -v '^$') ]]; then
+    cp "$backup" "$bindings"
+    hyprctl reload >/dev/null 2>&1
+    rm -f "$backup"
+    echo "Hyprland rejected $keys" >&2
+    return 1
+  fi
+  rm -f "$backup"
+  mkdir -p "$(dirname "$state")"
+  echo "$keys" >"$state"
+  echo ok
+}
+
+case ${1-} in
+  --show) current ;;
+  --check) check "${2-}" ;;
+  "") echo "usage: ask-ai-bind --show | --check <keys> | <keys>" >&2; exit 2 ;;
+  *) set_keys "$1" ;;
+esac

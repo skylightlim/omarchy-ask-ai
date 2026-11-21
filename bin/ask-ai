@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# Select part of the screen and send it straight to the AI chat, with the
+# AI, pre-prompt and auto-send choice set in the Ask AI bar panel.
+#
+# Usage: ask-ai [smart|region|windows|fullscreen]
+#   smart (default): drag a region, click a window, or click empty space for
+#   the whole monitor, exactly like Omarchy's own screenshot.
+
+set -euo pipefail
+shopt -s nullglob
+
+plugin_id="skylightlim.ask-ai"
+plugin_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+mode=${1:-smart}
+
+case $mode in
+  smart | region | windows | fullscreen) ;;
+  *) echo "Usage: ask-ai [smart|region|windows|fullscreen]" >&2; exit 2 ;;
+esac
+
+notify() {
+  omarchy-notification-send -g 󰙴 "Ask AI" "$1" >/dev/null 2>&1 || notify-send "Ask AI" "$1"
+}
+
+# First run: give the user an editable config next to their other dotfiles.
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ask-ai"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/ask-ai"
+mkdir -p "$config_dir" "$state_dir"
+config="$config_dir/config.json"
+state="$state_dir/state.json"
+[[ -f $config ]] || cp "$plugin_dir/config.default.json" "$config"
+[[ -f $state ]] || echo '{}' >"$state"
+
+# Captures live in the private runtime dir and are replaced by the next one.
+shot_dir="${XDG_RUNTIME_DIR:-/tmp/ask-ai-$UID}/ask-ai"
+mkdir -p -m 700 "$shot_dir"
+rm -f "$shot_dir"/*.png
+
+# Don't capture the panel itself.
+omarchy-shell -q "$plugin_id" close || true
+
+if command -v omasnap >/dev/null; then
+  OMASNAP_SCREENSHOT_DIR="$shot_dir" omasnap "$mode" --save >/dev/null 2>&1 || true
+else
+  geometry=$(slurp 2>/dev/null) || exit 0
+  grim -g "$geometry" "$shot_dir/capture-$(date +%s%N).png"
+fi
+
+shots=("$shot_dir"/*.png)
+(( ${#shots[@]} )) || exit 0 # selection cancelled
+
+# omasnap announces every file it saves; this one goes straight to the chat,
+# so take its card off the screen as it arrives.
+saved=$(omarchy-i18n capture.screenshotSaved 2>/dev/null) || saved="Screenshot saved"
+(for delay in 0.1 0.4 1; do
+  sleep "$delay"
+  omarchy-shell -q notifications dismiss "$saved"
+done) >/dev/null 2>&1 &
+
+# The choices from the panel (see settings.jq).
+fields=()
+if ! mapfile -d '' -t fields < <(
+  jq -jn -f "$plugin_dir/bin/settings.jq" --slurpfile d "$plugin_dir/config.default.json" \
+    --slurpfile c "$config" --slurpfile s "$state" 2>/dev/null
+) || (( ${#fields[@]} != 9 )); then
+  wl-copy --type image/png <"${shots[-1]}"
+  notify "Couldn't read ~/.config/ask-ai/config.json. Is it valid JSON? The capture is on your clipboard."
+  exit 1
+fi
+
+# Answer in a card: the hidden browser asks, the card shows the answer.
+if [[ ${fields[8]} == 1 && -n ${fields[0]} ]]; then
+  exec "$plugin_dir/bin/ask-ai-ask" "${shots[-1]}" "${fields[0]}" "${fields[7]}" "${fields[2]}"
+fi
+
+args=(--image "${shots[-1]}" --prompt "${fields[2]}" --load-timeout "${fields[4]}" --submit-delay "${fields[5]}")
+if [[ -n ${fields[0]} ]]; then
+  args+=(--url "${fields[0]}" --match "${fields[1]}")
+else
+  args+=(--current)
+fi
+[[ ${fields[3]} == 1 ]] && args+=(--submit)
+[[ ${fields[6]} == 1 ]] && args+=(--special scratchpad)
+
+exec "$plugin_dir/bin/ask-ai-send" "${args[@]}"

@@ -1,0 +1,353 @@
+#!/bin/bash
+
+# Put a capture and a prompt into an AI chat in the computer's default browser.
+#
+# Usage: ask-ai-send --image <png> (--url <https-url> [--match <title-regex>] | --current)
+#                    [--prompt <text>] [--submit] [--submit-delay <s>] [--load-timeout <s>]
+#                    [--special <name>]
+#
+# --url opens the chat in a new tab of the default browser and waits for one
+# of its windows to show a title matching --match. --current pastes into the
+# default browser's window used last instead. The image and then the prompt
+# are pasted with Ctrl+V; --submit presses Enter afterwards. Keys only ever
+# go to that browser window: if it can't be brought to the front, it stops
+# and leaves the capture on the clipboard.
+#
+# --special opens the chat on the special workspace special:<name> (Omarchy's
+# scratchpad is "scratchpad", on Super+S), in the default browser's window
+# there, or a new window moved there. It then shows over the current workspace.
+
+set -uo pipefail
+
+# Each run traces its steps, timestamped, to $XDG_RUNTIME_DIR/ask-ai/send.log
+# (replaced by the next run), to explain a send that stopped short or ran slow.
+log_dir="${XDG_RUNTIME_DIR:-/tmp/ask-ai-$UID}/ask-ai"
+mkdir -p -m 700 "$log_dir"
+exec 2>"$log_dir/send.log"
+PS4='+ ${EPOCHREALTIME} '
+set -x
+
+plugin_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+image="" url="" match="" prompt="" submit=0 current=0 special=""
+submit_delay=0.2 load_timeout=10
+
+while (( $# )); do
+  case $1 in
+    --image) image=${2-}; shift 2 ;;
+    --url) url=${2-}; shift 2 ;;
+    --match) match=${2-}; shift 2 ;;
+    --current) current=1; shift ;;
+    --prompt) prompt=${2-}; shift 2 ;;
+    --submit) submit=1; shift ;;
+    --submit-delay) submit_delay=${2-}; shift 2 ;;
+    --load-timeout) load_timeout=${2-}; shift 2 ;;
+    --special) special=${2-}; shift 2 ;;
+    *) echo "ask-ai-send: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+notify() {
+  omarchy-notification-send -g 󰙴 "Ask AI" "$1" >/dev/null 2>&1 || notify-send "Ask AI" "$1"
+}
+
+fail() {
+  [[ -f $image ]] && wl-copy --type image/png <"$image"
+  notify "$1"
+  exit 1
+}
+
+[[ -f $image ]] || fail "The capture is gone. Take it again."
+(( current )) || [[ $url =~ ^https?:// ]] || fail "\"$url\" is not an http(s) address. Check ~/.config/ask-ai/config.json."
+[[ $submit_delay =~ ^[0-9]+([.][0-9]+)?$ ]] || submit_delay=0.2
+[[ $load_timeout =~ ^[0-9]+([.][0-9]+)?$ ]] || load_timeout=10
+[[ -z $special || $special =~ ^[A-Za-z0-9_-]+$ ]] || fail "\"$special\" isn't a usable workspace name."
+special_ws=${special:+special:$special}
+
+browser=$("$plugin_dir/bin/ask-ai-browser") ||
+  fail "No default browser is set. Pick one with: omarchy default browser"
+browser_class=$(jq -r '.class // empty' <<<"$browser")
+browser_name=$(jq -r '.name // empty' <<<"$browser")
+[[ -n $browser_class ]] || fail "Couldn't tell which windows belong to the default browser."
+
+# ------------------------------------------------------------ time
+# Bash's own clock, in milliseconds: no process per check.
+
+now_ms() { REPLY=$(( ${EPOCHREALTIME/./} / 1000 )); }
+to_ms() { local s=$1 whole frac; whole=${s%%.*}; frac=${s#"$whole"}; frac=${frac#.}000; REPLY=$(( 10#${whole:-0} * 1000 + 10#${frac:0:3} )); }
+past() { now_ms; (( REPLY - $1 >= $2 )); } # past <start-ms> <duration-ms>
+
+to_ms "$load_timeout"; load_timeout_ms=$REPLY
+
+# ------------------------------------------------------------ windows
+
+# The default browser's windows, matched by Hyprland class.
+windows='[ .[] | select(.mapped != false) | select((.class | ascii_downcase) == ($class | ascii_downcase)) ]'
+
+# Which of them a send may use: with --special, any (a new window starts out on
+# a regular workspace); otherwise only those on regular workspaces, so a chat
+# never lands in a hidden special one.
+usable='map(select($ws != "" or (.workspace.name | startswith("special:") | not)))'
+
+# The window used last. $1 = special: only one on the special workspace.
+last_browser_window() {
+  hyprctl clients -j 2>/dev/null | jq -r --arg class "$browser_class" --arg ws "$special_ws" --arg where "${1:-}" \
+    "$windows | $usable | map(select(\$where != \"special\" or .workspace.name == \$ws))
+     | sort_by(.focusHistoryID) | first // empty | .address"
+}
+
+# Everything about $address in one look: win_exists, win_chat (its title names
+# the AI, or no title is required), win_active, win_geometry, win_workspace.
+read_window() {
+  local line clients active
+  clients=$(hyprctl clients -j 2>/dev/null) || clients='[]'
+  active=$(hyprctl activewindow -j 2>/dev/null) || active='{}'
+  [[ $active == \{* ]] || active='{}'
+  line=$(jq -rn --arg a "$address" --arg m "$match" --argjson any "$(( current || ${#match} == 0 ))" \
+    --argjson clients "$clients" --argjson active "$active" '
+    ($clients | map(select(.address == $a)) | first) as $w
+    | if $w == null then "0 0 0 - -" else
+        [1,
+         (if $any == 1 or ($w.title | test($m; "i")) then 1 else 0 end),
+         (if $active.address == $a then 1 else 0 end),
+         "\($w.at[0]),\($w.at[1]):\($w.size[0])x\($w.size[1])",
+         $w.workspace.name] | map(tostring) | join(" ") end' 2>/dev/null)
+  read -r win_exists win_chat win_active win_geometry win_workspace <<<"${line:-0 0 0 - -}"
+  win_geometry=${win_geometry/:/ }
+}
+
+# Focus $address. Focus follows the mouse here, so a pointer left over another
+# window would take focus back on its next twitch: park it on this one.
+focus() {
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+    hyprctl dispatch focuswindow "address:$address" >/dev/null 2>&1
+  read_window
+  [[ $win_geometry == - ]] && return
+  local x y w h cx cy
+  read -r x y w h <<<"${win_geometry//[,x]/ }"
+  read -r cx cy < <(hyprctl cursorpos 2>/dev/null | tr -d ,)
+  if [[ -z ${cx:-} ]] || (( cx < x || cx >= x + w || cy < y || cy >= y + h )); then
+    hyprctl dispatch "hl.dsp.cursor.move({ x = $(( x + w / 2 )), y = $(( y + h / 2 )) })" >/dev/null 2>&1 ||
+      hyprctl dispatch movecursor "$(( x + w / 2 ))" "$(( y + h / 2 ))" >/dev/null 2>&1
+  fi
+}
+
+# Keys only ever go to the chosen browser window while it shows the chat:
+# bring it back if focus has wandered, and stop rather than type anywhere else.
+ensure_focus() {
+  read_window
+  (( win_exists )) || fail "The $browser_name window closed. The capture is on your clipboard."
+  (( win_chat )) || fail "The chat tab is no longer in front, so nothing was typed. The capture is on your clipboard."
+  (( win_active )) && return
+  focus
+  sleep 0.1
+  read_window
+  (( win_active )) ||
+    fail "Couldn't bring $browser_name to the front, so nothing was typed. The capture is on your clipboard."
+}
+
+# The default-browser window that has just opened the chat, as
+# "<address>|<windows whose title changed this look>". It must name the AI in
+# its title, and its title must have changed at some point since the launch
+# (listed in $seen) or the window must be new: a tab often reuses the title the
+# window already showed. $1 = 1 drops the change rule, as a last resort. The
+# window used last wins ties: it's the one the browser gave the tab.
+find_chat_window() {
+  hyprctl clients -j 2>/dev/null | jq -r --arg class "$browser_class" --arg m "$match" --arg ws "$special_ws" \
+    --arg want "$preferred" --arg seen "$seen" --argjson before "$before" --argjson stale "$1" "
+    (\$before | map({ (.address): .title }) | add // {}) as \$old
+    | ($windows | $usable) as \$mine
+    | (\$mine | map(select(\$old[.address] != .title) | .address)) as \$changed
+    | (\$changed + (\$seen | split(\",\"))) as \$moved
+    | (\$mine
+       | map(select(.title | test(\$m; \"i\")) | select(\$stale == 1 or (.address as \$x | \$moved | index(\$x))))
+       | sort_by((if .address == \$want then 0 else 1 end), .focusHistoryID)
+       | first // {} | .address // \"\") as \$chat
+    | \"\(\$chat)|\(\$changed | join(\",\"))\"" 2>/dev/null
+}
+
+# ------------------------------------------------------------ watching the page
+# Chat pages show their title well before they can take a pasted image (an
+# early ChatGPT paste just vanishes), and nothing outside the page says when
+# they're ready. So watch the window itself: small screenshots of it, and how
+# many pixels changed between two of them.
+
+snap_dir=$(mktemp -d "$log_dir/snaps.XXXXXX")
+trap 'rm -rf "$snap_dir"' EXIT
+
+snap() {
+  [[ $win_geometry != - ]] && grim -g "$win_geometry" -s 0.5 -t ppm "$1" 2>/dev/null
+}
+
+# Pixels that differ between two snapshots, as a whole number.
+changed_pixels() {
+  local out
+  out=$(magick compare -metric AE -fuzz 8% "$1" "$2" null: 2>&1)
+  out=${out%% *}
+  if [[ $out == *[eE]* ]]; then REPLY=$(awk -v v="$out" 'BEGIN { printf "%d", v }'); else REPLY=${out%%.*}; fi
+  [[ $REPLY =~ ^[0-9]+$ ]] || REPLY=0
+}
+
+# The snapshot's pixel count, from the window size at half scale.
+snap_pixels() {
+  local size=${win_geometry#* } w h
+  w=${size%x*} h=${size#*x}
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || { REPLY=1; return; }
+  REPLY=$(( (w / 2) * (h / 2) ))
+  (( REPLY > 0 )) || REPLY=1
+}
+
+# Wait, up to $1 ms, until the page stops changing: $2 (default 2) unchanged
+# looks in a row, ~0.35 s apart. Two outlast a page's pause between loading
+# and starting up; one is enough to see an upload spinner has stopped, since
+# it never stands still. A blinking caret is too small to count (under 0.03%
+# of the window).
+wait_until_settled() {
+  local started calm=0 needed=${2:-2} a="$snap_dir/a.ppm" b="$snap_dir/b.ppm" limit
+  now_ms; started=$REPLY
+  snap_pixels; limit=$(( REPLY * 3 / 10000 ))
+  snap "$a" || return 0
+  while ! past "$started" "$1"; do
+    sleep 0.2
+    snap "$b" || return 0
+    changed_pixels "$a" "$b"
+    if (( REPLY > limit )); then calm=0; else calm=$(( calm + 1 )); fi
+    (( calm >= needed )) && return 0
+    mv "$b" "$a"
+  done
+}
+
+# Did something appear since the snapshot $1 (an attachment: over 0.1% of the
+# window)? Waits up to $2 ms.
+changed_since() {
+  local started after="$snap_dir/after.ppm" limit
+  now_ms; started=$REPLY
+  snap_pixels; limit=$(( REPLY / 1000 ))
+  while ! past "$started" "$2"; do
+    sleep 0.12
+    snap "$after" || return 1
+    changed_pixels "$1" "$after"
+    (( REPLY > limit )) && return 0
+  done
+  return 1
+}
+
+# ------------------------------------------------------------ find the chat
+
+address="" win_geometry=-
+if (( current )); then
+  address=$(last_browser_window)
+  [[ -n $address ]] || fail "No $browser_name window is open. The capture is on your clipboard."
+  focus
+  sleep 0.2
+else
+  before=$(hyprctl clients -j 2>/dev/null | jq -c '[ .[] | { address, title } ]')
+  if [[ -n $special_ws ]]; then
+    preferred=$(last_browser_window special)
+  else
+    preferred=$(last_browser_window)
+  fi
+  # Omarchy's launcher hands the URL to the running browser (or starts it)
+  # and brings it to the front. The browser gives the tab to the window it
+  # saw last, so focus the right one first; with none to take it, the chat
+  # gets a window of its own.
+  if [[ -n $preferred ]]; then
+    address=$preferred
+    focus
+    sleep 0.08
+    omarchy-launch-browser "$url" >/dev/null 2>&1 &
+  else
+    omarchy-launch-browser --new-window "$url" >/dev/null 2>&1 &
+  fi
+
+  # Wait for the chat page. A title that never changed only counts after
+  # 1.5 s, by when the new tab is surely in front.
+  now_ms; started=$REPLY
+  chat="" seen=""
+  while ! past "$started" "$load_timeout_ms"; do
+    stale=0
+    past "$started" 1500 && stale=1
+    IFS='|' read -r chat changed <<<"$(find_chat_window "$stale")"
+    [[ -n $changed ]] && seen="$seen,$changed"
+    [[ -n $chat ]] && { [[ -n $match ]] || (( stale )); } && break
+    chat=""
+    sleep 0.1
+  done
+
+  [[ -n $chat ]] ||
+    fail "The chat didn't open in $browser_name within ${load_timeout}s, so nothing was typed. The capture is on your clipboard."
+  address=$chat
+  # A new window moves to the special workspace; focusing it there shows the
+  # workspace over the current one.
+  read_window
+  if [[ -n $special_ws && $win_workspace != "$special_ws" ]]; then
+    hyprctl dispatch "hl.dsp.window.move({ window = \"address:$address\", workspace = \"$special_ws\", follow = false })" >/dev/null 2>&1 ||
+      hyprctl dispatch movetoworkspacesilent "$special_ws,address:$address" >/dev/null 2>&1
+    sleep 0.15
+  fi
+  ensure_focus
+  # A fresh page is never ready the moment its title shows.
+  sleep 0.3
+fi
+
+# Paste only once the page has settled.
+wait_until_settled 10000
+
+# ------------------------------------------------------------ paste and send
+
+# Copy right before each Ctrl+V and check the clipboard holds it, so a copy
+# elsewhere (a clipboard sync, another app) can't slip in between.
+paste() {
+  local mime=$1 tries
+  ensure_focus
+  if [[ $mime == image/png ]]; then
+    wl-copy --type image/png <"$image"
+  else
+    printf '%s' "$prompt" | wl-copy --type "$mime"
+  fi
+  for (( tries = 0; tries < 15; tries++ )); do
+    wl-paste --list-types 2>/dev/null | grep -qxF "$mime" && break
+    sleep 0.03
+  done
+  (( tries < 15 )) ||
+    fail "Something else took over the clipboard, so nothing was pasted. The capture is on your clipboard."
+  wtype -M ctrl -k v -m ctrl
+}
+
+# Paste the image and check that an attachment showed up; if the page
+# dropped it, let it settle and paste again.
+attached=0
+for attempt in 1 2 3; do
+  ensure_focus
+  snap "$snap_dir/before.ppm"
+  paste image/png
+  if changed_since "$snap_dir/before.ppm" 1500; then
+    attached=1
+    break
+  fi
+  wait_until_settled 3000
+done
+# The thumbnail showing means the page has read the image.
+sleep 0.1
+
+if [[ -n $prompt ]]; then
+  paste 'text/plain;charset=utf-8'
+  sleep 0.15
+fi
+
+if (( ! attached )); then
+  wl-copy --type image/png <"$image"
+  notify "The image didn't attach, so nothing was sent. It's on your clipboard: click the chat box and press Ctrl+V."
+  exit 1
+fi
+
+if (( submit )); then
+  # Enter before the upload finishes sends the text without the image, so
+  # wait at least submitDelay, then until the upload spinner stops.
+  sleep "$submit_delay"
+  wait_until_settled 20000 1
+  ensure_focus
+  wtype -k Return
+fi
+
+sleep 0.1
+wl-copy --type image/png <"$image"

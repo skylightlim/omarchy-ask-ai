@@ -1,0 +1,14 @@
+{
+  "targets": [
+    { "name": "ChatGPT", "url": "https://chatgpt.com/", "match": "ChatGPT" },
+    { "name": "Claude", "url": "https://claude.ai/new", "match": "Claude" },
+    { "name": "Gemini", "url": "https://gemini.google.com/app", "match": "Gemini" },
+    { "name": "DeepSeek", "url": "https://chat.deepseek.com/", "match": "DeepSeek" }
+  ],
+  "prompts": [
+    { "name": "Explain", "text": "Explain what's in this screenshot." },
+    { "name": "Solve", "text": "Solve this step by step and explain your reasoning." }
+  ],
+  "loadTimeout": 10,
+  "submitDelay": 0.2
+}

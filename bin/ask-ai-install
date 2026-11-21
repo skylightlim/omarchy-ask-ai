@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# Finish setting Ask AI up, after `omarchy plugin add ... --enable`:
+#
+#   - puts `ask-ai` on your PATH (~/.local/bin)
+#   - binds Super+Shift+A to it in ~/.config/hypr/bindings.lua, with the
+#     submap the panel uses to record a new shortcut
+#   - installs CloakBrowser for the hidden browser, unless a Python already has it
+#   - lists any other tool that's missing
+#
+# Safe to run again: each step is skipped once done.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/ask-ai"
+bindings="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
+label="Ask AI about a screen region"
+
+step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+step "Command"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$plugin_dir/bin/ask-ai" "$HOME/.local/bin/ask-ai"
+echo "~/.local/bin/ask-ai -> $plugin_dir/bin/ask-ai"
+
+step "Shortcut"
+if [[ ! -f $bindings ]]; then
+  echo "No $bindings; bind ask-ai to a key yourself."
+else
+  changed=0
+  if ! grep -qF "\"$label\"" "$bindings"; then
+    cp "$bindings" "$bindings.bak.$(date +%s)"
+    cat >>"$bindings" <<EOF
+
+-- Ask AI (skylightlim.ask-ai plugin): select a screen region and it goes to the
+-- AI chat set in its bar panel. Set the keys from the panel (click the
+-- shortcut); o.rebind takes them over from whatever had them, and that comes
+-- back if Ask AI moves elsewhere.
+o.rebind("SUPER + SHIFT + A", "$label", "ask-ai")
+EOF
+    changed=1
+    echo "Super+Shift+A runs ask-ai (it replaces Omarchy's ChatGPT web app key; change it from the panel)."
+  else
+    echo "Already bound: $("$plugin_dir/bin/ask-ai-bind" --show)"
+  fi
+  if ! grep -qF 'define_submap("ask-ai-record"' "$bindings"; then
+    cat >>"$bindings" <<'EOF'
+
+-- While the Ask AI panel records a new shortcut, every key goes to it. If you
+-- are ever stuck here, Super+Escape leaves.
+hl.define_submap("ask-ai-record", function()
+  hl.bind("SUPER + Escape", hl.dsp.submap("reset"))
+end)
+EOF
+    changed=1
+  fi
+  if (( changed )) && command -v hyprctl >/dev/null; then
+    hyprctl reload >/dev/null
+    sleep 0.5
+    errors=$(hyprctl configerrors 2>/dev/null | grep -v '^$')
+    [[ -z $errors ]] || printf 'Hyprland reports config errors:\n%s\n' "$errors"
+  fi
+fi
+
+step "Hidden browser (CloakBrowser)"
+if py=$("$plugin_dir/bin/ask-ai-python"); then
+  echo "Using $py"
+else
+  venv="$data_dir/venv"
+  echo "Installing CloakBrowser into $venv"
+  mkdir -p "$data_dir"
+  if command -v uv >/dev/null; then
+    uv venv -q --python 3.12 "$venv" && uv pip install -q --python "$venv/bin/python" cloakbrowser
+  else
+    python3 -m venv "$venv" && "$venv/bin/pip" install -q cloakbrowser
+  fi
+  py=$("$plugin_dir/bin/ask-ai-python") || { echo "CloakBrowser didn't install; the card mode won't work."; py=""; }
+fi
+if [[ -n ${py:-} ]]; then
+  # Fetch the browser now rather than on the first capture.
+  (cd "$plugin_dir/browser" && PYTHONDONTWRITEBYTECODE=1 "$py" -c 'import common, cloakbrowser; cloakbrowser.ensure_binary()' >/dev/null 2>&1) &&
+    echo "Browser ready." || echo "The browser will download on first use."
+fi
+
+step "Other tools"
+missing=()
+need() { command -v "$1" >/dev/null || missing+=("$2"); }
+need jq jq
+need wl-copy wl-clipboard
+need socat socat
+need Xvfb xorg-server-xvfb
+need wtype wtype
+command -v omasnap >/dev/null || { need slurp slurp; need grim grim; }
+if ((${#missing[@]})); then
+  echo "Missing: ${missing[*]}"
+  echo "Install with: omarchy pkg add ${missing[*]}"
+else
+  echo "All there."
+fi
+
+step "Next"
+echo "1. Click the sparkles icon on the bar, then Sign in to AIs, and sign in to the AIs you use."
+echo "2. Press Super+Shift+A, select part of the screen, and the answer appears top-right."

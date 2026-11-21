@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "skylightlim.ask-ai",
+  "name": "Ask AI",
+  "version": "3.1.0",
+  "author": "skylightlim",
+  "license": "MIT",
+  "description": "Select part of your screen and ask ChatGPT, Claude, Gemini or DeepSeek about it. A hidden browser asks, and the answer appears in a card over your screen. Pick the AI, pre-prompt and shortcut from the bar.",
+  "homepage": "https://github.com/skylightlim/omarchy-ask-ai",
+  "repository": "https://github.com/skylightlim/omarchy-ask-ai",
+  "keywords": [
+    "ai",
+    "chatgpt",
+    "claude",
+    "deepseek",
+    "gemini",
+    "prompt",
+    "region",
+    "screenshot"
+  ],
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "overlay": "Answer.qml"
+  },
+  "keepLoaded": true,
+  "barWidget": {
+    "displayName": "Ask AI",
+    "description": "Pick the AI, pre-prompt and shortcut for Ask AI. Right-click to capture.",
+    "category": "Productivity",
+    "aliases": [
+      "ask-ai",
+      "ai",
+      "chatgpt",
+      "claude",
+      "gemini",
+      "screenshot"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

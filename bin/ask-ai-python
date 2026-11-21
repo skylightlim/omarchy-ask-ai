@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Print a Python that can run Ask AI's hidden browser (one with the
+# cloakbrowser package): $ASK_AI_PYTHON, the venv bin/ask-ai-install makes,
+# or a CloakBrowser setup at ~/cloakbrowser. Exits 1 if there is none.
+
+for py in "${ASK_AI_PYTHON:-}" \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/ask-ai/venv/bin/python" \
+  "$HOME/cloakbrowser/.venv/bin/python"; do
+  if [[ -n $py && -x $py ]] && "$py" -c 'import cloakbrowser' 2>/dev/null; then
+    echo "$py"
+    exit 0
+  fi
+done
+exit 1

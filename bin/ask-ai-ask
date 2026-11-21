@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# Send a capture to Ask AI's hidden browser and show the answer in the card.
+#
+# Usage: ask-ai-ask <image.png> <chat-url> <ai-name> <prompt>
+#
+# The card opens straight away and follows a job file the hidden browser
+# (browser/askd.py) writes as the AI answers. The browser starts on first use
+# and stops itself after half an hour idle.
+
+set -uo pipefail
+
+plugin_dir=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+image=${1-} url=${2-} ai=${3-} prompt=${4-}
+
+run_dir="${XDG_RUNTIME_DIR:-/tmp/ask-ai-$UID}/ask-ai"
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/ask-ai"
+sock="$run_dir/askd.sock"
+mkdir -p -m 700 "$run_dir"
+mkdir -p "$data_dir"
+find "$run_dir" -maxdepth 1 -name 'job-*.json' -mmin +120 -delete 2>/dev/null
+
+job="$run_dir/job-$(date +%s%N).json"
+jq -cn --arg ai "$ai" '{status: "starting", ai: $ai, text: "", url: "", error: ""}' >"$job"
+omarchy-shell shell summon skylightlim.ask-ai "$(jq -cn --arg job "$job" --arg ai "$ai" '{job: $job, ai: $ai}')" >/dev/null
+
+fail() {
+  jq -cn --arg ai "$ai" --arg error "$1" '{status: "error", ai: $ai, text: "", url: "", error: $error}' >"$job"
+  [[ -f $image ]] && wl-copy --type image/png <"$image"
+  exit 1
+}
+
+[[ -f $image ]] || fail "The capture is gone. Take it again."
+[[ $url =~ ^https:// ]] || fail "\"$url\" isn't an https address. Check ~/.config/ask-ai/config.json."
+
+up() { socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null; }
+
+if ! up; then
+  py=$("$plugin_dir/bin/ask-ai-python") ||
+    fail "CloakBrowser isn't installed. Run $plugin_dir/bin/ask-ai-install."
+  pgrep -f "$plugin_dir/browser/login.py" >/dev/null &&
+    fail "Close the Ask AI sign-in window first."
+  setsid -f env PYTHONDONTWRITEBYTECODE=1 "$py" "$plugin_dir/browser/askd.py" \
+    >>"$data_dir/askd.log" 2>&1 </dev/null
+  for _ in {1..150}; do
+    up && break
+    sleep 0.1
+  done
+  up || fail "The hidden browser didn't start. See ~/.local/share/ask-ai/askd.log."
+fi
+
+reply=$(jq -cn --arg url "$url" --arg ai "$ai" --arg image "$image" --arg prompt "$prompt" --arg out "$job" \
+  '{url: $url, ai: $ai, image: $image, prompt: $prompt, out: $out}' |
+  socat -t 5 - "UNIX-CONNECT:$sock" 2>/dev/null)
+[[ $reply == accepted ]] || fail "The hidden browser didn't take the job."

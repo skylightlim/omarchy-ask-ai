@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Print the computer's default browser as JSON:
+#   {"desktop": "chromium.desktop", "name": "Chromium", "exec": "chromium", "class": "chromium"}
+# "class" is the Hyprland window class its windows carry.
+
+set -uo pipefail
+
+desktop=$(omarchy-cmd-default-browser 2>/dev/null) || desktop=""
+[[ -n $desktop ]] || desktop=$(xdg-settings get default-web-browser 2>/dev/null) || desktop=""
+
+entry=""
+IFS=: read -ra dirs <<<"${XDG_DATA_HOME:-$HOME/.local/share}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+for dir in "${dirs[@]}"; do
+  if [[ -n $desktop && -f $dir/applications/$desktop ]]; then
+    entry=$dir/applications/$desktop
+    break
+  fi
+done
+
+if [[ -z $entry ]]; then
+  echo '{}'
+  exit 1
+fi
+
+# Keys from the [Desktop Entry] group only, not its actions.
+main_group() { sed -n '/^\[Desktop Entry\]/,/^\[/p' "$entry"; }
+name=$(main_group | sed -n 's/^Name=//p' | head -1)
+exec_bin=$(main_group | sed -n 's/^Exec=\([^ ]*\).*/\1/p' | head -1)
+wm_class=$(main_group | sed -n 's/^StartupWMClass=//p' | head -1)
+[[ -n $wm_class ]] || wm_class=$(basename "$exec_bin" -stable)
+
+jq -cn --arg desktop "$desktop" --arg name "${name:-$wm_class}" --arg exec "$exec_bin" --arg class "$wm_class" \
+  '{ desktop: $desktop, name: $name, exec: $exec, class: $class }'
