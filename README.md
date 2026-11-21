@@ -26,6 +26,16 @@ Then sign in: click the sparkles icon, **Sign in to AIs**, sign in to the AIs yo
 
 Needs `jq`, `wl-clipboard`, `socat`, `xorg-server-xvfb`, Python 3, and `omasnap` (or `slurp` and `grim`). `wtype` is only needed for browser mode.
 
+## Remove
+
+```bash
+omarchy plugin remove skylightlim.ask-ai --yes
+rm -f ~/.local/bin/ask-ai
+rm -rf ~/.local/state/ask-ai
+```
+
+Then delete the lines Ask AI added to `~/.config/hypr/bindings.lua`: the `o.rebind("SUPER + SHIFT + A", "Ask AI about a screen region", "ask-ai")` line and the `ask-ai-record` submap block, each under an `-- Ask AI` comment. Install keeps a `bindings.lua.bak.<time>` copy from before it edited the file, and Omarchy's ChatGPT key comes back once the line is gone. CloakBrowser is left in place; remove it yourself if nothing else uses it.
+
 ## The panel
 
 Click the sparkles icon on the bar. Right-click it to capture straight away.
